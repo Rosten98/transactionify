@@ -1,0 +1,37 @@
+name: PR Pipeline — transactionify
+'on':
+  pull_request:
+    branches:
+      - main
+      - master
+env:
+  SERVICE_NAME: transactionify
+  LANGUAGE: python
+jobs:
+  validate_conventions:
+    name: Validate conventions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Work ID in PR title
+        run: |-
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          if ! echo "$PR_TITLE" | grep -qE "[A-Z]+-\d+"; then
+            echo "ERROR: PR title must contain a Work ID (e.g. FIN-123)"
+            exit 1
+          fi
+          echo "Work ID check passed: $PR_TITLE"
+  small_tests:
+    name: Small tests
+    runs-on: ubuntu-latest
+    needs:
+      - validate_conventions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: cd test/unit/src/python && pytest -v
