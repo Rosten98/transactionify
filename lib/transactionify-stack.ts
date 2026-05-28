@@ -1,187 +1,193 @@
-#!/usr/bin/env node
-import * as cdk from 'aws-cdk-lib';
-import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
-import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
-import * as apigwv2_integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
-import * as apigwv2_authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
-import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { Construct } from 'constructs';
+import * as cdk from "aws-cdk-lib";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
+import * as apigwv2_integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as apigwv2_authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
+import * as lambda from "aws-cdk-lib/aws-lambda";
+import { Construct } from "constructs";
+import { GoldenPathStack, GoldenPathStackProps } from "devex-framework";
 
-export class TransactionifyStack extends cdk.Stack {
-    constructor(scope: Construct, id: string, props?: cdk.StackProps) {
-        super(scope, id, props);
+/*
+  Decisión arquitectónica: TransactionifyStack extiende GoldenPathStack
+  en lugar de reemplazarlo.
 
-        // Apply tags to all resources in this stack
-        cdk.Tags.of(this).add('finops:Project', 'Transactionify');
-        cdk.Tags.of(this).add('finops:Service', 'Transactionify API');
-        cdk.Tags.of(this).add('finops:Team', 'Platform');
-        cdk.Tags.of(this).add('finops:Owner', 'ruy.garcia');
-        cdk.Tags.of(this).add('project-type', 'api')
-        cdk.Tags.of(this).add('infrastructure', 'cdk');
+  Esto implementa el principio de composición — el equipo de Transactionify
+  hereda todas las convenciones del Golden Path (variables de entorno de
+  contexto, outputs estándar, runtime correcto para Python) y agrega
+  encima su infraestructura específica (DynamoDB, múltiples Lambdas,
+  authorizer).
 
-        // DynamoDB table for single table pattern
-        const table = new dynamodb.Table(this, 'DynamoDBTable', {
-            tableName: `${cdk.Stack.of(this).stackName}-table`,
-            partitionKey: {
-                name: 'PK',
-                type: dynamodb.AttributeType.STRING,
-            },
-            sortKey: {
-                name: 'SK',
-                type: dynamodb.AttributeType.STRING,
-            },
-            billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-            removalPolicy: cdk.RemovalPolicy.DESTROY,
-            timeToLiveAttribute: 'ttl',
-        });
+  Lo que aporta GoldenPathStack:
+  - Tags estándar de DORA y auditoría
+  - Variables de entorno SERVICE_NAME, ENVIRONMENT, LANGUAGE
+  - CfnOutputs estandarizados
+  - Runtime ARM64 por default
 
-        // API Gateway v2 (HTTP API)
-        const httpApi = new apigwv2.HttpApi(this, 'HttpApi', {
-            apiName: `${cdk.Stack.of(this).stackName}-api`,
-            createDefaultStage: true,
-        });
+  Lo que agrega TransactionifyStack:
+  - DynamoDB con single table pattern
+  - HTTP API v2 con authorizer
+  - Múltiples Lambdas con handlers específicos
+*/
+export class TransactionifyStack extends GoldenPathStack {
+  constructor(scope: Construct, id: string, props: GoldenPathStackProps) {
+    /*
+      Llamamos al constructor del padre con la configuración de Transactionify.
+      El handler y codePath del padre no se usan directamente porque
+      Transactionify tiene múltiples Lambdas, pero los necesitamos
+      para satisfacer el contrato de GoldenPathStackProps.
+    */
+    super(scope, id, {
+      ...props,
+      service: "transactionify",
+      language: "python",
+      environment: props.environment,
+      codePath: "src/python",
+      handler: "transactionify.handlers.api.rest.account.create.main.handler",
+    });
 
-        const authorizerLambda = new lambda.Function(this, 'AuthorizerLambda', {
-            functionName: `${cdk.Stack.of(this).stackName}-authorizer`,
-            runtime: lambda.Runtime.PYTHON_3_9,
-            handler: 'transactionify.handlers.authorizer.main.handler',
-            code: lambda.Code.fromAsset('src/python'),
-            environment: {
-                TABLE_NAME: table.tableName,
-            },
-        });
+    // Tags de finops heredados del Golden Path + específicos de Transactionify
+    cdk.Tags.of(this).add("finops:Project", "Transactionify");
+    cdk.Tags.of(this).add("finops:Service", "Transactionify API");
+    cdk.Tags.of(this).add("finops:Team", "Platform");
 
-        // Grant read permissions to authorizer Lambda
-        table.grantReadData(authorizerLambda);
+    // DynamoDB — single table pattern
+    const table = new dynamodb.Table(this, "DynamoDBTable", {
+      tableName: `${cdk.Stack.of(this).stackName}-table`,
+      partitionKey: {
+        name: "PK",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: {
+        name: "SK",
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: "ttl",
+    });
 
-        const authorizer = new apigwv2_authorizers.HttpLambdaAuthorizer('LambdaAuthorizer', authorizerLambda, {
-            identitySource: ['$request.header.Authorization'],
-            resultsCacheTtl: cdk.Duration.minutes(0),
-            responseTypes: [apigwv2_authorizers.HttpLambdaResponseType.SIMPLE],
-        });
+    // HTTP API v2
+    const httpApi = new apigwv2.HttpApi(this, "HttpApi", {
+      apiName: `${cdk.Stack.of(this).stackName}-api`,
+      createDefaultStage: true,
+    });
 
-        const provisioningLambda = new lambda.Function(this, 'ProvisioningLambda', {
-            description: 'Registers a new user by generating a new API Key. This is NOT to be exposed as an API endpoint.',
-            functionName: `${cdk.Stack.of(this).stackName}-provisioning`,
-            runtime: lambda.Runtime.PYTHON_3_9,
-            handler: 'transactionify.handlers.provisioning.main.handler',
-            code: lambda.Code.fromAsset('src/python'),
-            environment: {
-                TABLE_NAME: table.tableName,
-            },
-        });
+    /*
+      Función helper para crear Lambdas con convenciones estándar.
 
-        // Grant write permissions to provisioning Lambda
-        table.grantWriteData(provisioningLambda);
+      Decisión: extraemos esto como función local para evitar repetición
+      y garantizar que todas las Lambdas del stack tienen las mismas
+      variables de entorno de contexto que el framework requiere para
+      emitir eventos DORA.
+    */
+    const createLambda = (
+      id: string,
+      handler: string,
+      description: string
+    ): lambda.Function => {
+      return new lambda.Function(this, id, {
+        description,
+        functionName: `${cdk.Stack.of(this).stackName}-${id.toLowerCase()}`,
+        runtime: lambda.Runtime.PYTHON_3_11,
+        handler,
+        code: lambda.Code.fromAsset("src/python"),
+        architecture: lambda.Architecture.ARM_64,
+        environment: {
+          TABLE_NAME: table.tableName,
+          // Variables de contexto del framework para DORA
+          SERVICE_NAME: "transactionify",
+          ENVIRONMENT: props.environment,
+          LANGUAGE: "python",
+        },
+      });
+    };
 
-        // Lambda function for creating new Account
-        const createAccountLambda = new lambda.Function(this, 'CreateAccountLambda', {
-            description: 'Creates a new account for the authenticated user',
-            functionName: `${cdk.Stack.of(this).stackName}-create-account`,
-            runtime: lambda.Runtime.PYTHON_3_9,
-            handler: 'transactionify.handlers.api.rest.account.create.main.handler',
-            code: lambda.Code.fromAsset('src/python'),
-            environment: {
-                TABLE_NAME: table.tableName,
-            },
-        });
+    // Authorizer Lambda
+    const authorizerLambda = createLambda(
+      "AuthorizerLambda",
+      "transactionify.handlers.authorizer.main.handler",
+      "API Key authorizer"
+    );
+    table.grantReadData(authorizerLambda);
 
-        // Grant read/write permissions to create account Lambda
-        table.grantReadWriteData(createAccountLambda);
+    const authorizer = new apigwv2_authorizers.HttpLambdaAuthorizer(
+      "LambdaAuthorizer",
+      authorizerLambda,
+      {
+        identitySource: ["$request.header.Authorization"],
+        resultsCacheTtl: cdk.Duration.minutes(0),
+        responseTypes: [apigwv2_authorizers.HttpLambdaResponseType.SIMPLE],
+      }
+    );
 
-        // Create new Account
-        const createAccountIntegration = new apigwv2_integrations.HttpLambdaIntegration('CreateAccountIntegration', createAccountLambda);
-        httpApi.addRoutes({
-            path: '/api/v1/accounts',
-            methods: [apigwv2.HttpMethod.POST],
-            integration: createAccountIntegration,
-            authorizer: authorizer,
-        });
+    // Provisioning Lambda
+    const provisioningLambda = createLambda(
+      "ProvisioningLambda",
+      "transactionify.handlers.provisioning.main.handler",
+      "Registers a new user by generating a new API Key"
+    );
+    table.grantWriteData(provisioningLambda);
 
-        // Lambda function for creating new Payment
-        const createPaymentLambda = new lambda.Function(this, 'CreatePaymentLambda', {
-            description: 'Creates a new payment for an account',
-            functionName: `${cdk.Stack.of(this).stackName}-create-payment`,
-            runtime: lambda.Runtime.PYTHON_3_9,
-            handler: 'transactionify.handlers.api.rest.payment.create.main.handler',
-            code: lambda.Code.fromAsset('src/python'),
-            environment: {
-                TABLE_NAME: table.tableName,
-            },
-        });
+    // Create Account Lambda
+    const createAccountLambda = createLambda(
+      "CreateAccountLambda",
+      "transactionify.handlers.api.rest.account.create.main.handler",
+      "Creates a new account for the authenticated user"
+    );
+    table.grantReadWriteData(createAccountLambda);
 
-        // Grant read/write permissions to create payment Lambda
-        table.grantReadWriteData(createPaymentLambda);
+    // Create Payment Lambda
+    const createPaymentLambda = createLambda(
+      "CreatePaymentLambda",
+      "transactionify.handlers.api.rest.payment.create.main.handler",
+      "Creates a new payment for an account"
+    );
+    table.grantReadWriteData(createPaymentLambda);
 
-        // Create new Payment
-        const createPaymentIntegration = new apigwv2_integrations.HttpLambdaIntegration('CreatePaymentIntegration', createPaymentLambda);
-        httpApi.addRoutes({
-            path: '/api/v1/accounts/{account_id}/payments',
-            methods: [apigwv2.HttpMethod.POST],
-            integration: createPaymentIntegration,
-            authorizer: authorizer,
-        });
+    // Get Balance Lambda
+    const getBalanceLambda = createLambda(
+      "GetBalanceLambda",
+      "transactionify.handlers.api.rest.balance.get.main.handler",
+      "Gets the balance for an account"
+    );
+    table.grantReadData(getBalanceLambda);
 
-        // Lambda function for getting account balance
-        const getBalanceLambda = new lambda.Function(this, 'GetBalanceLambda', {
-            description: 'Gets the balance for an account',
-            functionName: `${cdk.Stack.of(this).stackName}-get-balance`,
-            runtime: lambda.Runtime.PYTHON_3_9,
-            handler: 'transactionify.handlers.api.rest.balance.get.main.handler',
-            code: lambda.Code.fromAsset('src/python'),
-            environment: {
-                TABLE_NAME: table.tableName,
-            },
-        });
+    // List Transactions Lambda
+    const listTransactionsLambda = createLambda(
+      "ListTransactionsLambda",
+      "transactionify.handlers.api.rest.transaction.list.main.handler",
+      "Lists all transactions for an account"
+    );
+    table.grantReadData(listTransactionsLambda);
 
-        // Grant read permissions to get balance Lambda
-        table.grantReadData(getBalanceLambda);
+    // Rutas del API
+    const addRoute = (
+      path: string,
+      method: apigwv2.HttpMethod,
+      fn: lambda.Function,
+      integrationId: string
+    ) => {
+      httpApi.addRoutes({
+        path,
+        methods: [method],
+        integration: new apigwv2_integrations.HttpLambdaIntegration(
+          integrationId,
+          fn
+        ),
+        authorizer,
+      });
+    };
 
-        // Get Balance
-        const getBalanceIntegration = new apigwv2_integrations.HttpLambdaIntegration('GetBalanceIntegration', getBalanceLambda);
-        httpApi.addRoutes({
-            path: '/api/v1/accounts/{account_id}/balance',
-            methods: [apigwv2.HttpMethod.GET],
-            integration: getBalanceIntegration,
-            authorizer: authorizer,
-        });
+    addRoute("/api/v1/accounts", apigwv2.HttpMethod.POST, createAccountLambda, "CreateAccountIntegration");
+    addRoute("/api/v1/accounts/{account_id}/payments", apigwv2.HttpMethod.POST, createPaymentLambda, "CreatePaymentIntegration");
+    addRoute("/api/v1/accounts/{account_id}/balance", apigwv2.HttpMethod.GET, getBalanceLambda, "GetBalanceIntegration");
+    addRoute("/api/v1/accounts/{account_id}/transactions", apigwv2.HttpMethod.GET, listTransactionsLambda, "ListTransactionsIntegration");
 
-        // Lambda function for listing account transactions
-        const listTransactionsLambda = new lambda.Function(this, 'ListTransactionsLambda', {
-            description: 'Lists all transactions for an account',
-            functionName: `${cdk.Stack.of(this).stackName}-list-transactions`,
-            runtime: lambda.Runtime.PYTHON_3_9,
-            handler: 'transactionify.handlers.api.rest.transaction.list.main.handler',
-            code: lambda.Code.fromAsset('src/python'),
-            environment: {
-                TABLE_NAME: table.tableName,
-            },
-        });
-
-        // Grant read permissions to list transactions Lambda
-        table.grantReadData(listTransactionsLambda);
-
-        // List Transactions
-        const listTransactionsIntegration = new apigwv2_integrations.HttpLambdaIntegration('ListTransactionsIntegration', listTransactionsLambda);
-        httpApi.addRoutes({
-            path: '/api/v1/accounts/{account_id}/transactions',
-            methods: [apigwv2.HttpMethod.GET],
-            integration: listTransactionsIntegration,
-            authorizer: authorizer,
-        });
-
-        // Output the API Gateway URL
-        new cdk.CfnOutput(this, 'ApiUrl', {
-            value: httpApi.apiEndpoint,
-            description: 'HTTP API Gateway endpoint URL',
-            exportName: `${cdk.Stack.of(this).stackName}-api-url`,
-        });
-
-        // Output the DynamoDB table name
-        new cdk.CfnOutput(this, 'TableName', {
-            value: table.tableName,
-            description: 'DynamoDB table name',
-            exportName: `${cdk.Stack.of(this).stackName}-table-name`,
-        });
-    }
+    // Outputs adicionales específicos de Transactionify
+    new cdk.CfnOutput(this, "TableName", {
+      value: table.tableName,
+      description: "DynamoDB table name",
+      exportName: `${cdk.Stack.of(this).stackName}-table-name`,
+    });
+  }
 }
